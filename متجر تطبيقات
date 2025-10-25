@@ -1,0 +1,245 @@
+hmdy/
+├─ backend/
+│  ├─ server.js
+│  ├─ package.json
+│  ├─ Dockerfile
+│  ├─ .gitignore
+│  ├─ .env.example
+│  ├─ config/
+│  │   └─ db.js
+│  ├─ models/
+│  │   ├─ User.js
+│  │   └─ App.js
+│  ├─ controllers/
+│  │   ├─ authController.js
+│  │   └─ appController.js
+│  ├─ routes/
+│  │   ├─ auth.js
+│  │   └─ apps.js
+│  ├─ middleware/
+│  │   ├─ auth.js
+│  │   └─ upload.js
+│  └─ utils/
+│      └─ virusScan.js
+├─ frontend/
+│  ├─ package.json
+│  ├─ public/
+│  │   └─ index.html
+│  └─ src/
+│      ├─ index.js
+│      ├─ App.js
+│      └─ components/
+│          ├─ Navbar.js
+│          ├─ AppList.js
+│          └─ UploadForm.js
+{
+  "name": "hmdy-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.0.3",
+    "jsonwebtoken": "^9.0.0",
+    "bcryptjs": "^2.4.3",
+    "multer": "^1.4.5",
+    "aws-sdk": "^2.1419.0",
+    "node-fetch": "^3.3.2",
+    "form-data": "^4.0.0"
+  }
+}
+PORT=10000
+MONGO_URI=your_mongodb_uri
+JWT_SECRET=your_jwt_secret
+AWS_ACCESS_KEY_ID=your_aws_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret
+AWS_REGION=us-east-1
+AWS_BUCKET_NAME=your_s3_bucket
+VT_API_KEY=your_virustotal_key
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const app = express();
+require('dotenv').config();
+
+const authRoutes = require('./routes/auth');
+const appRoutes = require('./routes/apps');
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.log(err));
+
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use('/api/auth', authRoutes);
+app.use('/api/apps', appRoutes);
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const mongoose = require('mongoose');
+
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI);
+    console.log('MongoDB connected');
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+};
+
+module.exports = connectDB;
+const fs = require('fs');
+const fetch = require('node-fetch');
+const FormData = require('form-data');
+
+const VT_API_KEY = process.env.VT_API_KEY;
+
+async function scanWithVirusTotal(filePath) {
+  if (!VT_API_KEY) return { provider: 'none', skipped: true };
+
+  const form = new FormData();
+  form.append('file', fs.createReadStream(filePath));
+
+  const res = await fetch('https://www.virustotal.com/api/v3/files', {
+    method: 'POST',
+    headers: { 'x-apikey': VT_API_KEY },
+    body: form
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error('VT upload failed: ' + txt);
+  }
+
+  const json = await res.json();
+  const id = json.data.id;
+
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const r2 = await fetch(`https://www.virustotal.com/api/v3/analyses/${id}`, {
+      headers: { 'x-apikey': VT_API_KEY }
+    });
+    const j2 = await r2.json();
+    if (j2.data?.attributes?.status === 'completed') {
+      const stats = j2.data.attributes.stats;
+      return { provider: 'virustotal', stats, raw: j2 };
+    }
+  }
+
+  return { provider: 'virustotal', stats: null, raw: null };
+}
+
+async function smartScan(filePath) {
+  return await scanWithVirusTotal(filePath);
+}
+
+module.exports = { smartScan };
+const AWS = require('aws-sdk');
+const fs = require('fs');
+const App = require('../models/App');
+const { smartScan } = require('../utils/virusScan');
+
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION
+});
+
+async function uploadFileToS3(file) {
+  const fileContent = fs.readFileSync(file.path);
+  const params = {
+    Bucket: process.env.AWS_BUCKET_NAME,
+    Key: `${Date.now()}-${file.originalname.replace(/\s+/g,'_')}`,
+    Body: fileContent,
+    ContentType: file.mimetype,
+    ACL: 'public-read'
+  };
+  const data = await s3.upload(params).promise();
+  return data.Location;
+}
+
+async function uploadApp(req, res) {
+  try {
+    const { name, description, category, coverUrl } = req.body;
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: 'File required' });
+
+    const scan = await smartScan(file.path);
+    if (scan.stats?.malicious > 0) {
+      fs.unlinkSync(file.path);
+      return res.status(400).json({ message: 'File flagged as malicious', scan });
+    }
+
+    const fileUrl = await uploadFileToS3(file);
+
+    const newApp = new App({
+      name,
+      description,
+      category,
+      coverUrl: coverUrl || '',
+      files: [{ name: file.originalname, url: fileUrl, size: file.size }],
+      owner: req.user._id,
+      published: false,
+      downloads: 0,
+      stats: { downloadsHistory: [] }
+    });
+
+    await newApp.save();
+    fs.unlinkSync(file.path);
+    res.json({ message: 'Uploaded (pending publish)', app: newApp, scan });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+module.exports = { uploadApp };
+import React from 'react';
+import AppList from './components/AppList';
+import UploadForm from './components/UploadForm';
+
+function App() {
+  return (
+    <div>
+      <h1>Hmdy - متجر التطبيقات</h1>
+      <UploadForm />
+      <AppList />
+    </div>
+  );
+}
+
+export default App;
+import React, { useState } from 'react';
+
+export default function UploadForm() {
+  const [file, setFile] = useState(null);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch(`${process.env.REACT_APP_API_URL}/api/apps/upload`, {
+      method: 'POST',
+      body: formData,
+      headers: {
+        'Authorization': `Bearer ${localStorage.getItem('token')}`
+      }
+    });
+    const data = await res.json();
+    alert(JSON.stringify(data));
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input type="file" onChange={e => setFile(e.target.files[0])} />
+      <button type="submit">رفع التطبيق</button>
+    </form>
+  );
+}
